@@ -1,0 +1,168 @@
+#SQL
+------------------------
+---------- Tempos e Movimentos - Geral
+
+
+	(with ids_procurados as (        
+	--- Selecionar os id_dim_customer para a análise
+	select distinct x.id_dim_customer from analytics.dim_customer x where x.is_fast_onboarding is true
+	)
+	--- Escolher a data de início de contato ( CRM + SALES )
+	, data_contato as ( 
+	SELECT 
+   '2021-01-01'     ::DATE AS data_minima,    -- selecionar a data minima
+   '2099-01-01'     ::DATE AS data_maxima     -- selecionar a data maxima
+	
+	--- Início da Query
+	) ,	psu as (
+	select lc.id_dim_customer ,
+		   'presignup' as event_type,
+		   lc.event_date as event_date
+	from analytics.funnel_20_lastclick lc
+	left join analytics.dim_customer dc on
+	lc.id_dim_customer = dc.id_dim_customer 
+	where  lc.id_dim_customer in ( select distinct id_dim_customer from ids_procurados )
+	and event_type = 'PRESIGNUP'
+	) ,    su as (
+	select lc.id_dim_customer ,
+		   'signup' as event_type,
+		   lc.event_date as event_date
+	from analytics.funnel_20_lastclick lc
+	where lc.id_dim_customer in ( select distinct id_dim_customer from ids_procurados )	
+	and event_type = 'SIGNUP'
+	) ,    historia as (
+	select lc.id_dim_customer ,
+		   'historia_aprovada' as event_type,
+		   lc.event_date as event_date
+	from analytics.funnel_20_lastclick lc
+	where lc.id_dim_customer in ( select distinct id_dim_customer from ids_procurados )		
+	and event_type = 'HISTORY APPROVED'
+	) ,    acq as (
+	select lc.id_dim_customer ,
+		   'aquisicao' as event_type,
+		   lc.event_date as event_date
+	from analytics.funnel_20_lastclick lc
+	where lc.id_dim_customer in ( select distinct id_dim_customer from ids_procurados )		
+	and event_type = 'OPERATION PROCESSED'
+	and first_processed_operation_remittance is true
+	), criacao_historia as (
+	select fh.id_dim_customer ,
+		   convert_timezone('America/Recife',	fh.created_at) as event_date,
+		   ROW_NUMBER() OVER(PARTITION BY fh.id_dim_customer ORDER BY fh.created_at asc) AS rowNumber
+	from analytics.fact_history fh
+	where fh.id_dim_customer in ( select distinct id_dim_customer from ids_procurados )			
+	) , historia_criada as (
+	select   id_dim_customer,
+	         'historia_criada' as event_type,
+		     event_date as event_date
+	from criacao_historia
+	where rowNumber = 1
+	) , email_enviado as (
+	select distinct 	   
+	   dc.id_dim_customer,
+	   ee.subject as event_type,
+	   ee.sentby__created as event_date
+from analytics.stitch_hubspot.email_events ee
+left join analytics.dim_customer dc on
+ee.recipient = dc.email 
+where dc.id_dim_customer in ( select distinct id_dim_customer from ids_procurados )
+and ee.type  in ('SENT') 
+and dc.id_dim_customer is not null
+and ee.sentby__created >= (select data_minima from data_contato) 
+and ee.sentby__created >= (select data_maxima from data_contato) 
+
+	) , contato_comercial as ( 
+	----- Contacts
+select  dc.id_dim_customer ,
+	   	case
+	   	when hs.engagement__type = 'EMAIL' then metadata__subject 
+		when ((LEN(hs.metadata__body) - LEN(REPLACE(hs.metadata__body, '[', ''))) > 0 AND hs.engagement__type = 'CALL') THEN 'WHATSAPP'
+		when hs.metadata__disposition = 'f240bbac-87c9-4f6e-bf70-924b57d47db7' then 'LIGACAO - CONTATO EFETIVO'
+		ELSE 'LIGACAO - TENTATIVA CONTATO'
+		end as event_type,
+	   hs.engagement__createdat as event_date
+from stitch_hubspot.engagements hs 
+left join stitch_hubspot.engagements__associations__contactids ec ON 
+hs.engagement_id = ec._sdc_source_key_engagement_id
+left join stitch_hubspot.contacts co on 
+ec.value = co.vid
+left join analytics.dim_customer dc on 
+co.property_id_customer__value = dc.id_customer
+where dc.id_dim_customer in ( select distinct id_dim_customer from ids_procurados )
+and engagement__type in ( 'CALL' , 'EMAIL')
+and hs.engagement__createdat >= ( select data_minima from data_contato)	
+and hs.engagement__createdat <= ( select data_maxima from data_contato)	
+
+union 
+
+-- DEALS
+select  dc.id_dim_customer ,
+	   	case
+	   	when hs.engagement__type = 'EMAIL' then metadata__subject 
+		when ((LEN(hs.metadata__body) - LEN(REPLACE(hs.metadata__body, '[', ''))) > 0 AND hs.engagement__type = 'CALL') THEN 'WHATSAPP'
+		when hs.metadata__disposition = 'f240bbac-87c9-4f6e-bf70-924b57d47db7' then 'LIGACAO - CONTATO EFETIVO'
+		ELSE 'LIGACAO - TENTATIVA CONTATO'
+		end as event_type,
+	   hs.engagement__createdat as event_date
+from stitch_hubspot.engagements hs
+left join stitch_hubspot.engagements__associations__dealids ec on
+hs.engagement_id = ec._sdc_source_key_engagement_id
+left join stitch_hubspot.deals__associations__associatedvids de on
+ec.value = de._sdc_source_key_dealid
+left join stitch_hubspot.contacts co on
+de.value = co.vid
+left join analytics.dim_customer dc on
+co.property_id_customer__value = dc.id_customer
+where dc.id_dim_customer in ( select distinct id_dim_customer from ids_procurados )
+and engagement__type in ( 'CALL' , 'EMAIL')		
+and hs.engagement__createdat >= ( select data_minima from data_contato)	
+and hs.engagement__createdat <= ( select data_maxima from data_contato)	
+) , with_join as (
+	
+select * from psu
+union
+select * from su
+union
+select * from historia h
+union
+select * from acq 
+union
+select * from  historia_criada hc 
+union
+select * from email_enviado
+union
+select * from contato_comercial
+) 
+select distinct w.id_dim_customer,
+	   dc.id_customer ,
+	   dc.email ,
+	   dc.company_type,
+	   w.event_type,
+	   w.event_date,
+	   dn.description ,
+	   ROW_NUMBER() OVER(PARTITION BY w.id_dim_customer ORDER BY w.event_Date ASC) AS rowNumber
+from with_join w
+left join analytics.dim_customer dc on
+w.id_dim_customer = dc.id_dim_customer 
+left join analytics.dim_cnae dn on
+	dn.id_cnae = dc.company_cnae_id
+left join (
+		with z as (
+			select 
+			"session", 
+			division, 
+			"group", 
+			class, 
+			subclass , 
+			group_description ,
+			session_description ,
+			division_description ,
+			class_description,
+			row_number() over (partition by "subclass") as ddup 
+			from temp.cnae_estruturado
+		) select * from z where ddup = 1)  tc on
+	tc.subclass = dn.code
+------ filtros para analises
+--where w.id_dim_customer in ('703149')
+--where dc.id_customer in ('1326930')
+)
